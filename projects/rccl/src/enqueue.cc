@@ -2306,6 +2306,8 @@ static ncclResult_t updateCollCostTable(
     if (a == NCCL_ALGO_COLLNET_CHAIN && comm->maxLocalRanks > NCCL_MAX_DIRECT_ARITY+1) continue;
     if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) && (!nvlsSupport || (info->func != ncclFuncAllReduce && comm->localRanks > NCCL_MAX_NVLS_ARITY))) continue;
     if (a == NCCL_ALGO_NVLS && collNetSupport != 1 && comm->nNodes > 1) continue;
+    // [RCCL] DIRECT_A2A requires the mesh graph to have computed successfully
+    if (a == NCCL_ALGO_DIRECT_A2A && !comm->directA2aSupport) continue;
     /* Tree reduceScatter doesn't support scaling yet */
     if (a == NCCL_ALGO_PAT && info->func == ncclFuncReduceScatter
         && (info->opDev.op == ncclDevPreMulSum || info->opDev.op == ncclDevSumPostDiv)) continue;
@@ -2454,6 +2456,9 @@ static ncclResult_t topoGetAlgoInfo(
     if (maxNChannels > 0) {
       nc = std::min(maxNChannels, nc);
     }
+  } else if (info->algorithm == NCCL_ALGO_DIRECT_A2A) {
+    // [RCCL] DIRECT_A2A v1: single channel.
+    nc = 1;
   } else {
     rcclUpdateThreadThreshold(comm, nBytes, info, threadThreshold);
     INFO(NCCL_TUNING, "pre-adjustment threadThreshold:%i nBytes:%lu nc:%i", threadThreshold, nBytes, nc);
@@ -2698,6 +2703,7 @@ static ncclResult_t calcCollChunking(
       info->algorithm == NCCL_ALGO_NVLS_TREE ? ncclPatternNvlsTree :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
       info->algorithm == NCCL_ALGO_COLLNET_CHAIN ? ncclPatternCollnetChain :
+      info->algorithm == NCCL_ALGO_DIRECT_A2A ? ncclPatternMesh :
       info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUpDown :
       ncclPatternRingTwice;
     break;
@@ -2813,6 +2819,7 @@ static ncclResult_t calcCollChunking(
   case ncclPatternPipelineFrom:
   case ncclPatternPipelineTo:
   case ncclPatternCollnetChain:
+  case ncclPatternMesh:
     nstepsPerLoop = nchunksPerLoop = 1;
     break;
   case ncclPatternNvls:
@@ -2937,6 +2944,10 @@ static ncclResult_t calcCollChunking(
   case ncclPatternTreeUpDown:
   case ncclPatternNvlsTree:
     proxyOp->nPeers = (NCCL_MAX_TREE_ARITY - 1) * 2;
+    break;
+  case ncclPatternMesh:
+    // [RCCL] DIRECT_A2A: one connection per mesh peer in each direction
+    proxyOp->nPeers = comm->nRanks - 1;
     break;
   case ncclPatternCollnetChain:
   case ncclPatternCollnetDirect:

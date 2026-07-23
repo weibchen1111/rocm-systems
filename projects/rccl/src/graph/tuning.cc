@@ -137,7 +137,8 @@ fail:
 static const float baseLat  [NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS] = {
       { 12.0, 12.0, 17.0 }, { 12.0, 12.0, 17.0 },   // Tree, Ring
       { 12.0, 12.0, 17.0 }, { 12.0, 12.0, 17.0 },   // Collnet Direct, Chain
-      {    0,    0,    0 }, {    0,    0,    0 }};  // NVLS, NVLS Tree
+      {    0,    0,    0 }, {    0,    0,    0 },   // NVLS, NVLS Tree
+      {    0,    0,    0 }, {  6.0,  6.0,  9.0 }};  // PAT, DIRECT_A2A (one hop)
 
 // NVLink, PCI, Network
 #define NCCL_HW_NVLINK 0
@@ -719,6 +720,10 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 4*comm->WarpSize, maxNthreads, maxLLThreads, comm->WarpSize);
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
     getNthreads("NCCL_LL128_NTHREADS", ncclParamLl128Nthreads(), 4*comm->WarpSize, maxLL128Nthreads, maxLL128Nthreads, comm->WarpSize);
+  // [RCCL] DIRECT_A2A uses the same thread counts as RING.
+  comm->maxThreads[NCCL_ALGO_DIRECT_A2A][NCCL_PROTO_SIMPLE] = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
+  comm->maxThreads[NCCL_ALGO_DIRECT_A2A][NCCL_PROTO_LL] = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL];
+  comm->maxThreads[NCCL_ALGO_DIRECT_A2A][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128];
 #else
   int simpleDefaultThreads = (graphs[NCCL_ALGO_RING]->bwIntra*graphs[NCCL_ALGO_RING]->nChannels <= PCI_BW) ? 256 : NCCL_MAX_NTHREADS;
     comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] = getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, simpleDefaultThreads);
@@ -776,6 +781,9 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
           && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
           && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT) continue;
       if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
+      // [RCCL] DIRECT_A2A only runs when the mesh graph computed successfully
+      // (full-mesh net, 1 GPU/node, opted in via RCCL_DIRECT_A2A_ENABLE).
+      if (a == NCCL_ALGO_DIRECT_A2A && !comm->directA2aSupport) continue;
 
       for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
         if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_SIMPLE && (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) && comm->topo->nodes[GPU].count == comm->topo->nRanks) continue;
@@ -810,6 +818,12 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
           busBw *= comm->tunerConstants.bwRatio[0][a][p];
         else
           busBw *= comm->tunerConstants.bwRatio[1][a][p];
+        // [RCCL] The bwRatio tables have no DIRECT_A2A column yet (their 8th
+        // entry zero-initialises, which would zero busBw). Model the full
+        // mesh directly: every rank pushes its slice over its own dedicated
+        // per-peer link, so effective bus bandwidth is nChannels * net bw.
+        // TODO(cluster): fill proper bwRatio entries once measured.
+        if (a == NCCL_ALGO_DIRECT_A2A) busBw = graphs[a]->nChannels * bw;
         if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL && (coll == ncclFuncBroadcast || coll == ncclFuncReduce) && (IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx942") || IsArchMatch(comm->topo->nodes[GPU].nodes[0].gpu.gcn, "gfx950")) && comm->topo->nodes[GPU].count == comm->topo->nRanks) { busBw = busBw * 1.65; }
 #else
         if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL) { busBw = std::min(llMaxBw, busBw * .5); }
@@ -907,6 +921,10 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
             comm->latencies[coll][a][p] += log2i(nNodes) * (interLat/3.5) // Log latency
               + nRanks * 2.8; // Still a linear part; hopefully we'll manage to remove it at some point.
           }
+        } else if (a == NCCL_ALGO_DIRECT_A2A) {
+          // [RCCL] One-hop all-to-all: a single network hop, independent of
+          // nNodes (vs ring's 2*(nNodes-1) inter steps for AllReduce).
+          comm->latencies[coll][a][p] += interLat;
         }
       }
     }
