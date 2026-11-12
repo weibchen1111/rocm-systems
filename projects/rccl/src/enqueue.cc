@@ -7,6 +7,9 @@
  ************************************************************************/
 
 #include "enqueue.h"
+#include <map>
+#include <mutex>
+#include <vector>
 #include "argcheck.h"
 #include "coll_net.h"
 #include "graph/topo.h"
@@ -1906,6 +1909,41 @@ static void HIPRT_CB hostStreamPlanCallback(void* plan_) {
   return;
 }
 
+// RCCL_GRAPH_PROXY_BATCH=1: in a captured graph, one host node per comm uploads the proxy ops of every plan the
+// comm captured into that graph, in capture order, at the start of each replay. Without it each collective gets
+// its own host node, and on ROCm the GPU reaches every collective about 55 us before that node's callback runs,
+// which dominates small-message latency. Uploading ahead is what eager launches do as well: the proxy works
+// through the ops in order and each op waits for its kernel's FIFO counters.
+RCCL_PARAM(GraphProxyBatch, "GRAPH_PROXY_BATCH", 0);
+
+namespace {
+struct GraphProxyBatch {
+  struct ncclComm* comm;
+  unsigned long long graphId;
+  std::vector<struct ncclKernelPlan*> plans;
+};
+std::mutex graphProxyBatchMutex;
+std::map<std::pair<struct ncclComm*, unsigned long long>, GraphProxyBatch*> graphProxyBatches;
+} // namespace
+
+static void HIPRT_CB graphProxyBatchCallback(void* batch_) {
+  struct GraphProxyBatch* batch = (struct GraphProxyBatch*)batch_;
+  for (struct ncclKernelPlan* plan : batch->plans) {
+    ncclResult_t result = hostStreamPlanTask(batch->comm, plan);
+    if (result != ncclSuccess) WARN("graphProxyBatchCallback() failed : %s", ncclGetErrorString(result));
+  }
+}
+
+static void graphProxyBatchDestructor(void* batch_) {
+  struct GraphProxyBatch* batch = (struct GraphProxyBatch*)batch_;
+  {
+    std::lock_guard<std::mutex> lock(graphProxyBatchMutex);
+    auto it = graphProxyBatches.find({batch->comm, batch->graphId});
+    if (it != graphProxyBatches.end() && it->second == batch) graphProxyBatches.erase(it);
+  }
+  delete batch;
+}
+
 static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* me) {
   struct ncclKernelPlan* plan = (struct ncclKernelPlan*)me; // cast from first member `reclaim`
   if (plan->persistent) {
@@ -2160,7 +2198,43 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
 
     if (!persistent && comm->sharedRes->persistentRefs)
       status = CUDACLEARERROR(cudaEventQuery(comm->sharedRes->hostStream.serialEvent));
-    if (persistent || ncclCudaLaunchBlocking || status == cudaErrorNotReady) {
+    if (persistent && rcclParamGraphProxyBatch()) {
+      struct GraphProxyBatch* batch = nullptr;
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lock(graphProxyBatchMutex);
+        auto key = std::make_pair(comm, planner->capturingGraph.graphId);
+        auto it = graphProxyBatches.find(key);
+        if (it != graphProxyBatches.end()) {
+          batch = it->second;
+        } else {
+          batch = new GraphProxyBatch{comm, planner->capturingGraph.graphId, {}};
+          graphProxyBatches[key] = batch;
+          fresh = true;
+        }
+      }
+      for (struct ncclKernelPlan* plan = planHead; plan != nullptr; plan = plan->next) {
+        if (plan->hasProxyOps) {
+          plan->isHostCbEnq = true;
+          batch->plans.push_back(plan);
+        }
+      }
+      if (fresh) {
+        // The graph's first collective waits for the node, so all of the graph's ops are uploaded before any
+        // of its kernels can need them; later collectives run without a host node.
+        cudaStream_t hostStream;
+        NCCLCHECKGOTO(ncclStrongStreamAcquire(planner->capturingGraph, &comm->sharedRes->hostStream,
+                                              /*concurrent=*/false, &hostStream),
+                      result, failure);
+        CUDACHECKGOTO(cudaLaunchHostFunc(hostStream, graphProxyBatchCallback, batch), result, failure);
+        NCCLCHECKGOTO(ncclStreamWaitStream(launchStream, hostStream, comm->sharedRes->scratchEvent), result, failure);
+        NCCLCHECKGOTO(ncclStrongStreamRelease(planner->capturingGraph, &comm->sharedRes->hostStream,
+                                              /*concurrent=*/false),
+                      result, failure);
+        NCCLCHECKGOTO(ncclCudaGraphAddDestructor(planner->capturingGraph, graphProxyBatchDestructor, batch), result,
+                      failure);
+      }
+    } else if (persistent || ncclCudaLaunchBlocking || status == cudaErrorNotReady) {
       // We have to launch host tasks to push proxy args. We are careful to only
       // do this if necessary since host tasks impose a high performance cost in CUDA.
       bool acquired = false;
