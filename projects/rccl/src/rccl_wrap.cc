@@ -860,6 +860,10 @@ bool rcclCeAllReduceAllowed(struct ncclComm* comm) {
   return !comm->ceColl.graphModeSeen;
 }
 
+// RCCL_DIRECT_A2A_GRAPH=1 also takes DIRECT_A2A while a graph is being captured: its copy, grouped P2P and
+// reduction are all stream-ordered on the captured stream, so they replay as captured.
+RCCL_PARAM(DirectA2aGraph, "DIRECT_A2A_GRAPH", 0);
+
 // Single source of truth for AllReduce implementation selection. See the header
 // comment on rcclSelectAllReduce(). The priority chain and every gate below are a
 // faithful consolidation of what was previously split between ncclAllReduce_impl()
@@ -935,8 +939,8 @@ ncclResult_t rcclSelectAllReduce(struct ncclComm* comm, const void* sendbuff, vo
   // equivalent). Gated on: not symmetric, not graph-captured, not implicit
   // launch order, not inside a group, plus the standalone eligibility check
   // (arch/ranks/op/scratch).
-  if (!symEligible && !ceCapturing && !ncclParamLaunchOrderImplicit() && ncclGroupDepth == 0 &&
-      rcclDirectA2aAllReduceEligible(comm, count, datatype, op)) {
+  if (!symEligible && (!ceCapturing || rcclParamDirectA2aGraph()) && !ncclParamLaunchOrderImplicit() &&
+      ncclGroupDepth == 0 && rcclDirectA2aAllReduceEligible(comm, count, datatype, op)) {
     decision->algo = RCCL_DIRECT_A2A;
     return ncclSuccess;
   }
