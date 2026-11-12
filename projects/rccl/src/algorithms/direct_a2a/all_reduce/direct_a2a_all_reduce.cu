@@ -53,36 +53,41 @@ size_t directA2aOneShotThreshold(int nRanks) {
   return std::min<size_t>((size_t)configured, directA2aMaxBytes(nRanks));
 }
 
+// Sums the nRanks slots of scratch in rank order. With self != nullptr, rank selfRank's contribution is read from
+// self (the caller's send buffer, which may alias recvbuff) instead of its scratch slot, so no copy into the slot
+// is needed; each element is read before it is written by the same thread.
 template <typename T>
-__global__ void directA2aSumKernel(const T* __restrict__ scratch, T* __restrict__ recvbuff, size_t count, int nRanks) {
+__global__ void directA2aSumKernel(const T* __restrict__ scratch, const T* self, int selfRank, T* recvbuff,
+                                   size_t count, int nRanks) {
   for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < count;
        idx += (size_t)gridDim.x * blockDim.x) {
-    T sum = scratch[idx];
+    T sum = (self != nullptr && selfRank == 0) ? self[idx] : scratch[idx];
     for (int rank = 1; rank < nRanks; ++rank) {
-      sum = sum + scratch[(size_t)rank * count + idx];
+      sum = sum + ((self != nullptr && rank == selfRank) ? self[idx] : scratch[(size_t)rank * count + idx]);
     }
     recvbuff[idx] = sum;
   }
 }
 
 template <typename T>
-ncclResult_t launchDirectA2aSum(void* scratch, void* recvbuff, size_t count, int nRanks, cudaStream_t stream) {
+ncclResult_t launchDirectA2aSum(void* scratch, const void* self, int selfRank, void* recvbuff, size_t count,
+                                int nRanks, cudaStream_t stream) {
   int blocks = (int)dda::common::calcBlockCount(count, kDirectA2aThreads, kDirectA2aMaxBlocks);
   directA2aSumKernel<T><<<blocks, kDirectA2aThreads, 0, stream>>>(
-    static_cast<const T*>(scratch), static_cast<T*>(recvbuff), count, nRanks);
+    static_cast<const T*>(scratch), static_cast<const T*>(self), selfRank, static_cast<T*>(recvbuff), count, nRanks);
   CUDACHECK(cudaGetLastError());
   return ncclSuccess;
 }
 
-ncclResult_t launchDirectA2aSumByType(void* scratch, void* recvbuff, size_t count, int nRanks,
-                                      ncclDataType_t datatype, cudaStream_t stream) {
+ncclResult_t launchDirectA2aSumByType(void* scratch, const void* self, int selfRank, void* recvbuff, size_t count,
+                                      int nRanks, ncclDataType_t datatype, cudaStream_t stream) {
   switch (datatype) {
   case ncclFloat16:
-    return launchDirectA2aSum<half>(scratch, recvbuff, count, nRanks, stream);
+    return launchDirectA2aSum<half>(scratch, self, selfRank, recvbuff, count, nRanks, stream);
   case ncclBfloat16:
-    return launchDirectA2aSum<bf16>(scratch, recvbuff, count, nRanks, stream);
+    return launchDirectA2aSum<bf16>(scratch, self, selfRank, recvbuff, count, nRanks, stream);
   case ncclFloat32:
-    return launchDirectA2aSum<float>(scratch, recvbuff, count, nRanks, stream);
+    return launchDirectA2aSum<float>(scratch, self, selfRank, recvbuff, count, nRanks, stream);
   default:
     return ncclInvalidArgument;
   }
@@ -102,9 +107,6 @@ ncclResult_t directA2aOneShot(const void* sendbuff, void* recvbuff, size_t count
   const size_t bytes = count * ncclTypeSize(datatype);
   ncclResult_t ret = ncclSuccess;
 
-  void* selfSlot = static_cast<char*>(comm->directA2aScratch) + (size_t)comm->rank * bytes;
-  CUDACHECK(cudaMemcpyAsync(selfSlot, sendbuff, bytes, cudaMemcpyDeviceToDevice, stream));
-
   rccl::Recorder::instance().skip(true);
   ret = ncclGroupStart();
   if (ret == ncclSuccess) {
@@ -122,7 +124,9 @@ ncclResult_t directA2aOneShot(const void* sendbuff, void* recvbuff, size_t count
   rccl::Recorder::instance().skip(false);
   NCCLCHECK(ret);
 
-  return launchDirectA2aSumByType(comm->directA2aScratch, recvbuff, count, comm->nRanks, datatype, stream);
+  // The local contribution is read straight from sendbuff, so the one-shot path needs no copy into its slot.
+  return launchDirectA2aSumByType(comm->directA2aScratch, sendbuff, comm->rank, recvbuff, count, comm->nRanks,
+                                  datatype, stream);
 }
 
 ncclResult_t directA2aTwoShot(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
@@ -159,7 +163,7 @@ ncclResult_t directA2aTwoShot(const void* sendbuff, void* recvbuff, size_t count
   }
 
   if (ret == ncclSuccess) {
-    ret = launchDirectA2aSumByType(scratch, reducedShard, ownedCount, comm->nRanks, datatype, stream);
+    ret = launchDirectA2aSumByType(scratch, nullptr, 0, reducedShard, ownedCount, comm->nRanks, datatype, stream);
   }
 
   // AllGather: publish the reduced local shard and place each peer's shard
